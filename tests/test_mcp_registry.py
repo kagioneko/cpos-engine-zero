@@ -83,6 +83,64 @@ def test_mcp_definition_check_allows_at_sign_outside_authority(tmp_path):
     assert result["ok"] is True
 
 
+def test_mcp_definition_check_requires_a_real_host(tmp_path):
+    # netloc ":443" is non-empty but has no hostname; it must still be rejected.
+    secret_file = tmp_path / "github_token_file"
+    data = valid_definition(secret_file)
+    data["url"] = "https://:443/github"
+
+    result = check_connector_definition(data)
+
+    codes = {finding["code"] for finding in result["findings"]}
+    assert result["ok"] is False
+    assert "url_host_required" in codes
+
+
+def test_mcp_definition_check_blocks_bare_userinfo(tmp_path):
+    # Even empty userinfo ('https://@host') is credential syntax in the URL.
+    secret_file = tmp_path / "github_token_file"
+    data = valid_definition(secret_file)
+    data["url"] = "https://@mcp.example.test/github"
+
+    result = check_connector_definition(data)
+
+    codes = {finding["code"] for finding in result["findings"]}
+    assert result["ok"] is False
+    assert "url_userinfo_blocked" in codes
+
+
+def test_mcp_definition_check_warns_on_secret_in_query(tmp_path):
+    # A credential in the query string is the same leak class as userinfo, but
+    # the name match is heuristic, so it is a (non-blocking) warning to review.
+    secret_file = tmp_path / "github_token_file"
+    data = valid_definition(secret_file)
+    data["url"] = "https://mcp.example.test/github?access_token=dummycredential1234567890"
+
+    result = check_connector_definition(data)
+
+    review = [f for f in result["findings"] if f["code"] == "url_query_secret_review"]
+    assert review and review[0]["severity"] == "warning"
+    assert result["ok"] is True  # a warning alone does not block registration
+
+
+def test_mcp_definition_check_allows_benign_and_blank_query(tmp_path):
+    # Benign params - including compounds that merely CONTAIN a secret word
+    # (max_tokens, tokenizer) - and a secret-like param with a blank value, are
+    # all fine and must not raise url_query_secret_review.
+    secret_file = tmp_path / "github_token_file"
+    for url in (
+        "https://mcp.example.test/github?page=2&per_page=50",
+        "https://mcp.example.test/mcp?max_tokens=100&tokenizer=cl100k_base",
+        "https://mcp.example.test/github?token=",
+    ):
+        data = valid_definition(secret_file)
+        data["url"] = url
+        result = check_connector_definition(data)
+        codes = {finding["code"] for finding in result["findings"]}
+        assert "url_query_secret_review" not in codes, url
+        assert result["ok"] is True, url
+
+
 def test_mcp_registry_requires_check_then_confirm_before_register(tmp_path):
     registry = MCPRegistry(tmp_path / "connectors.json", tmp_path / "mcp_audit.jsonl")
     data = valid_definition(tmp_path / "token_file")

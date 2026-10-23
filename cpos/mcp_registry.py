@@ -7,7 +7,7 @@ import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 from .hash_chain import append_chained_jsonl, read_jsonl, verify_hash_chain
 from .pointer_os import utc_now
@@ -16,6 +16,14 @@ VALID_TRANSPORTS = {"stdio", "https", "sse"}
 VALID_STATUSES = {"active", "disabled", "revoked"}
 VALID_SENSITIVITY = {"public", "internal", "private", "restricted"}
 SECRETISH_KEYS = re.compile(r"(token|secret|password|passwd|api[_-]?key|private[_-]?key|credential)", re.I)
+# Credential-ish *query parameter* names, bounded so a benign compound like
+# max_tokens / tokenizer / password_policy does not match. Heuristic -> warning,
+# not a hard block (unlike unambiguous user:pass@ userinfo).
+URL_QUERY_SECRET = re.compile(
+    r"(?:^|[._-])(access[._-]?token|client[._-]?secret|api[._-]?key|apikey|private[._-]?key"
+    r"|token|secret|password|passwd|credential|signature|auth|sig|key)$",
+    re.I,
+)
 SHELL_META = re.compile(r"[;&|`$<>]")
 DANGEROUS_TOOLS = re.compile(r"(shell|exec|command|terminal|ssh|delete|remove|write_file|filesystem)", re.I)
 
@@ -161,14 +169,27 @@ def check_connector_definition(data: dict[str, Any]) -> dict[str, Any]:
             parsed = urlparse(str(connector.url))
             if parsed.scheme != "https":
                 findings.append(_finding("error", "https_required", "MCP remote connectors must use https:// only", "url"))
-            if not parsed.netloc:
+            # `netloc` is non-empty for `https://:443`, which has no hostname;
+            # require an actual host so a portspec-only authority is rejected.
+            if not parsed.hostname:
                 findings.append(_finding("error", "url_host_required", "MCP URL must include a host", "url"))
             # A credential embedded in the URL authority (user:pass@host) would be
             # persisted to the registry JSONL, the hash-chained audit log and git,
             # and echoed by anything that logs the URL. Credentials belong in
             # env_secret_files (Vault-rendered), never in the connector URL.
-            if parsed.username or parsed.password:
+            # `is not None` rejects all userinfo syntax, including a bare
+            # `https://@host` whose components are empty.
+            if parsed.username is not None or parsed.password is not None:
                 findings.append(_finding("error", "url_userinfo_blocked", "credentials must not be embedded in the URL (user:pass@host); use env_secret_files instead", "url"))
+            # A credential can also hide in the query string (?access_token=...),
+            # the same leak class as userinfo. This is a name heuristic (bounded
+            # match, so max_tokens / tokenizer do not trip it), so it is a
+            # warning to review, not a hard block: flag a secret-like parameter
+            # that carries a value; a blank value (?token=) is not a leak.
+            for q_name, q_value in parse_qsl(parsed.query, keep_blank_values=True):
+                if URL_QUERY_SECRET.search(q_name) and q_value.strip():
+                    findings.append(_finding("warning", "url_query_secret_review", "a query parameter looks like a credential; put credentials in env_secret_files, not the URL", "url"))
+                    break
 
     if not isinstance(connector.allowed_tools, list) or not connector.allowed_tools:
         findings.append(_finding("error", "allowed_tools_required", "allowed_tools must be an explicit non-empty allowlist", "allowed_tools"))
