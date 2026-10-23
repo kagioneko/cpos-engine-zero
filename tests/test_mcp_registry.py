@@ -54,6 +54,35 @@ def test_mcp_definition_check_rejects_http_raw_secrets_and_unapproved_dangerous_
     assert "dangerous_tool_requires_approval" in codes
 
 
+def test_mcp_definition_check_blocks_credentials_embedded_in_url(tmp_path):
+    # user:pass@host is https and has a host, so it passes https_required and
+    # url_host_required; it must be rejected on its own, or the credential lands
+    # in the registry JSONL / hash-chained audit log / git (userinfo leak class).
+    secret_file = tmp_path / "github_token_file"
+    data = valid_definition(secret_file)
+    data["url"] = "https://svcuser:dummycredential1234567890@mcp.example.test/github"
+
+    result = check_connector_definition(data)
+
+    codes = {finding["code"] for finding in result["findings"]}
+    assert result["ok"] is False
+    assert "url_userinfo_blocked" in codes
+    assert "https_required" not in codes  # scheme is https; only the userinfo is wrong
+
+
+def test_mcp_definition_check_allows_at_sign_outside_authority(tmp_path):
+    # '@' in the path is not userinfo and must not trip url_userinfo_blocked.
+    secret_file = tmp_path / "github_token_file"
+    data = valid_definition(secret_file)
+    data["url"] = "https://mcp.example.test/github@v2"
+
+    result = check_connector_definition(data)
+
+    codes = {finding["code"] for finding in result["findings"]}
+    assert "url_userinfo_blocked" not in codes
+    assert result["ok"] is True
+
+
 def test_mcp_registry_requires_check_then_confirm_before_register(tmp_path):
     registry = MCPRegistry(tmp_path / "connectors.json", tmp_path / "mcp_audit.jsonl")
     data = valid_definition(tmp_path / "token_file")

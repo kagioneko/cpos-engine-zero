@@ -163,6 +163,12 @@ def check_connector_definition(data: dict[str, Any]) -> dict[str, Any]:
                 findings.append(_finding("error", "https_required", "MCP remote connectors must use https:// only", "url"))
             if not parsed.netloc:
                 findings.append(_finding("error", "url_host_required", "MCP URL must include a host", "url"))
+            # A credential embedded in the URL authority (user:pass@host) would be
+            # persisted to the registry JSONL, the hash-chained audit log and git,
+            # and echoed by anything that logs the URL. Credentials belong in
+            # env_secret_files (Vault-rendered), never in the connector URL.
+            if parsed.username or parsed.password:
+                findings.append(_finding("error", "url_userinfo_blocked", "credentials must not be embedded in the URL (user:pass@host); use env_secret_files instead", "url"))
 
     if not isinstance(connector.allowed_tools, list) or not connector.allowed_tools:
         findings.append(_finding("error", "allowed_tools_required", "allowed_tools must be an explicit non-empty allowlist", "allowed_tools"))
