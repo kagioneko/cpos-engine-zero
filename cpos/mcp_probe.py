@@ -13,11 +13,17 @@ def _target(connector_id: str) -> str:
     return f"mcp://probe/{connector_id.replace('/', '_')}"
 
 
+# Safety flags returned on every probe denial, so a caller can never read a
+# denial as "something ran".
+_PROBE_SAFE_FLAGS = {"execute_automatically": False, "server_started": False, "network_requested": False, "tool_called": False, "secret_files_read": False}
+
+
 def request_mcp_capability_probe(
     registry: MCPRegistry,
     task_tape: TaskTapeStore,
     *,
     connector_id: str,
+    tls_observation: dict[str, Any] | None = None,
     actor: str = "MCPProbeHarness",
     purpose: str = "capability_probe",
     dry_run: bool = True,
@@ -27,6 +33,13 @@ def request_mcp_capability_probe(
     This does not start stdio servers, does not perform HTTPS/SSE requests, does not
     read secret files, and does not call tools. It only records the probe plan and
     approval gate metadata.
+
+    ``tls_observation`` is optional transport-handshake metadata supplied by
+    whatever would perform the probe's eventual connection. For a remote
+    (non-stdio) connector that declares a ``tls_policy``, the probe is gated
+    fail-closed: a missing observation, or one that fails the policy, denies the
+    probe. CPOS never opens the socket; it judges the producer-supplied
+    observation, never a live handshake.
     """
     connector = next((item for item in registry.load() if item.connector_id == connector_id), None)
     if connector is None:
@@ -37,6 +50,24 @@ def request_mcp_capability_probe(
     if not dry_run:
         registry.audit("probe_denied", actor=actor, connector_id=connector_id, decision="real_probe_disabled", metadata={"purpose": purpose})
         return {"ok": False, "error": "real_probe_disabled", "connector_id": connector_id, "execute_automatically": False}
+
+    # Fail-closed TLS gate: a remote connector that declares a tls_policy may not
+    # be probed without a TLS observation that satisfies that policy. A stdio
+    # connector, or a remote connector with no policy, is not gated here.
+    tls_summary = None
+    if connector.transport != "stdio" and connector.tls_policy is not None:
+        if tls_observation is None:
+            registry.audit("probe_denied", actor=actor, connector_id=connector_id, decision="tls_observation_required", metadata={"purpose": purpose, "tls_policy_declared": True})
+            return {"ok": False, "error": "tls_observation_required", "decision": "tls_denied", "connector_id": connector_id, **_PROBE_SAFE_FLAGS}
+        tls_result = registry.verify_tls(connector_id, tls_observation, actor=actor)
+        tls_codes = [f.get("code") for f in tls_result.get("findings", []) if isinstance(f, dict) and f.get("code")]
+        if not tls_result.get("ok"):
+            # Audit the gate denial here too: verify_tls audits the policy
+            # decision when it can, but its own early returns do not, so a denial
+            # must never be silent in the registry audit log.
+            registry.audit("probe_denied", actor=actor, connector_id=connector_id, decision="tls_probe_blocked", metadata={"purpose": purpose, "tls_finding_codes": tls_codes, "tls_decision": tls_result.get("decision")})
+            return {"ok": False, "error": "tls_probe_blocked", "decision": tls_result.get("decision", "tls_denied"), "tls_finding_codes": tls_codes, "connector_id": connector_id, **_PROBE_SAFE_FLAGS}
+        tls_summary = {"ok": True, "decision": tls_result.get("decision"), "finding_codes": tls_codes}
 
     human_escalation = review_escalation_decision(
         review_type="mcp_capability_probe",
@@ -61,6 +92,7 @@ def request_mcp_capability_probe(
         "declared_blocked_tools": list(connector.blocked_tools),
         "requires_human_approval": True,
         "human_escalation": human_escalation,
+        "tls_verification": tls_summary,
     }
     if connector.transport == "stdio":
         payload["probe_plan"] = ["validate argv shape", "prepare isolated process policy", "list_tools handshake only after approval"]

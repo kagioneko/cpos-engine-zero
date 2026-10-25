@@ -1414,6 +1414,7 @@ def mcp_probe_dry_run():
         mcp_registry(),
         agent.task_tape,
         connector_id=str(connector_id),
+        tls_observation=data.get('tls_observation'),
         actor=request_actor(),
         purpose=data.get('purpose') or 'http_mcp_capability_probe',
         dry_run=data.get('dry_run', True) is not False,
