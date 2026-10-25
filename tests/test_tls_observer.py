@@ -66,24 +66,103 @@ def _make_self_signed(tmp_path, cn="localhost"):
     return cert_path, key_path, expected_spki
 
 
-class _OneShotTLSServer:
-    """Serve exactly one TLS connection on 127.0.0.1 then close. The accept runs
-    in a daemon thread bounded by a timeout so it can never hang the test."""
+def _make_ca_and_leaf(tmp_path, cn="localhost"):
+    """Build a CA and a leaf signed by it. The chain PEM is leaf-then-CA for
+    load_cert_chain, so the server presents an intermediate the producer can
+    capture. Returns a dict of paths, cert objects and SPKIs."""
+    tmp_path = Path(tmp_path)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    now = dt.datetime.now(dt.timezone.utc)
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test CA"), x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Test Org")])
+    ca_ski = x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key())
+    ca_cert = (
+        x509.CertificateBuilder()
+        .subject_name(ca_name).issuer_name(ca_name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - dt.timedelta(minutes=5))
+        .not_valid_after(now + dt.timedelta(days=30))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(ca_ski, critical=False)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False, content_commitment=False, key_encipherment=False,
+                data_encipherment=False, key_agreement=False, key_cert_sign=True,
+                crl_sign=True, encipher_only=False, decipher_only=False,
+            ),
+            critical=True,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    leaf_cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)]))
+        .issuer_name(ca_name)
+        .public_key(leaf_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - dt.timedelta(minutes=5))
+        .not_valid_after(now + dt.timedelta(days=30))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(cn)]), critical=False)
+        .add_extension(x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(ca_ski), critical=False)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(leaf_key.public_key()), critical=False)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True, content_commitment=False, key_encipherment=True,
+                data_encipherment=False, key_agreement=False, key_cert_sign=False,
+                crl_sign=False, encipher_only=False, decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(x509.ExtendedKeyUsage([x509.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        .sign(ca_key, hashes.SHA256())
+    )
 
-    def __init__(self, cert_path, key_path):
+    chain_pem = tmp_path / "chain.pem"
+    chain_pem.write_bytes(leaf_cert.public_bytes(serialization.Encoding.PEM) + ca_cert.public_bytes(serialization.Encoding.PEM))
+    leaf_key_pem = tmp_path / "leaf_key.pem"
+    leaf_key_pem.write_bytes(leaf_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()))
+    ca_pem = tmp_path / "ca.pem"
+    ca_pem.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
+    return {
+        "chain_pem": chain_pem, "leaf_key": leaf_key_pem, "ca_pem": ca_pem,
+        "leaf_cert": leaf_cert, "ca_cert": ca_cert,
+        "leaf_spki": _spki_of(leaf_cert), "ca_spki": _spki_of(ca_cert),
+    }
+
+
+def _spki_of(cert):
+    return hashlib.sha256(
+        cert.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    ).hexdigest()
+
+
+class _OneShotTLSServer:
+    """Serve TLS connections on 127.0.0.1 (up to a small bound) then close. The
+    accept loop runs in a daemon thread bounded by a timeout so it can never
+    hang the test or block interpreter exit. Serving several (not one) lets a
+    single test drive both the stdlib handshake and an openssl s_client."""
+
+    def __init__(self, cert_path, key_path, max_conns=8):
         self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self._ctx.load_cert_chain(str(cert_path), str(key_path))
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind(("127.0.0.1", 0))
-        self._sock.listen(1)
+        self._sock.listen(5)
         self._sock.settimeout(_HANDSHAKE_TIMEOUT)
         self.port = self._sock.getsockname()[1]
+        self._max_conns = max_conns
         self._thread = threading.Thread(target=self._serve, daemon=True)
 
     def _serve(self):
-        try:
-            conn, _ = self._sock.accept()
+        for _ in range(self._max_conns):
+            try:
+                conn, _ = self._sock.accept()
+            except (OSError, socket.timeout):
+                return  # socket closed at __exit__, or no more clients
             conn.settimeout(_HANDSHAKE_TIMEOUT)  # bound the accepted socket too
             with conn:
                 try:
@@ -92,8 +171,6 @@ class _OneShotTLSServer:
                     tconn.close()
                 except (ssl.SSLError, OSError):
                     pass
-        except (OSError, socket.timeout):
-            pass
 
     def __enter__(self):
         self._thread.start()
@@ -233,3 +310,139 @@ def test_observer_raises_on_connection_failure():
         closed_port = probe.getsockname()[1]
     with pytest.raises(tls_observer.TLSObserverError):
         _observe_bounded(host="127.0.0.1", port=closed_port, server_hostname="localhost", timeout=1.0)
+
+
+# --- full-chain capture via openssl (intermediate pinning, CPOS②) -----------
+
+import shutil  # noqa: E402
+
+_OPENSSL = shutil.which("openssl")
+_needs_openssl = pytest.mark.skipif(_OPENSSL is None, reason="openssl not available")
+
+
+@_needs_openssl
+def test_full_chain_capture_includes_verified_intermediate(tmp_path):
+    ca = _make_ca_and_leaf(tmp_path)
+    with _OneShotTLSServer(ca["chain_pem"], ca["leaf_key"]) as srv:
+        obs = _observe_bounded(
+            host="127.0.0.1", port=srv.port, server_hostname="localhost",
+            cafile=str(ca["ca_pem"]), capture_chain=True,
+        )
+    # the verified path carries both the leaf and the issuing CA SPKI
+    assert ca["leaf_spki"] in obs["chain_spki_sha256"]
+    assert ca["ca_spki"] in obs["chain_spki_sha256"]
+    assert obs["leaf_spki_sha256"] == ca["leaf_spki"]
+
+
+@_needs_openssl
+def test_full_chain_end_to_end_intermediate_pinning(tmp_path):
+    # The money test: producer captures + verifies the chain; the primitive
+    # accepts it against a policy pinning the ISSUING CA's SPKI as intermediate.
+    ca = _make_ca_and_leaf(tmp_path)
+    with _OneShotTLSServer(ca["chain_pem"], ca["leaf_key"]) as srv:
+        obs = _observe_bounded(
+            host="127.0.0.1", port=srv.port, server_hostname="localhost",
+            cafile=str(ca["ca_pem"]), capture_chain=True,
+        )
+    connector = {
+        "url": "https://localhost/mcp",
+        "transport": "https",
+        "tls_policy": {
+            "min_version": "TLSv1.2",
+            "pinned_spki_sha256": [ca["leaf_spki"]],
+            "pinned_intermediate_spki_sha256": [ca["ca_spki"]],
+            "require_hostname_match": True,
+            "forbid_key_logging": True,
+        },
+    }
+    result = verify_tls_observation(connector, obs)
+    assert result["ok"] is True, result["findings"]
+
+    # and a policy pinning a WRONG intermediate is denied fail-closed
+    connector["tls_policy"]["pinned_intermediate_spki_sha256"] = ["cd" * 32]
+    denied = verify_tls_observation(connector, obs)
+    assert denied["ok"] is False
+    assert "tls_intermediate_spki_mismatch" in {f["code"] for f in denied["findings"]}
+
+
+def test_build_verified_chain_excludes_unrelated_appended_cert(tmp_path):
+    # P1 regression: a hostile server can APPEND any CA's cert to the presented
+    # bag. Verification must drop it -> its SPKI must NOT appear in the result,
+    # so intermediate pinning over the reported chain cannot be fooled.
+    ca = _make_ca_and_leaf(tmp_path)
+    unrelated = _make_ca_and_leaf(tmp_path / "other")  # a totally separate CA+leaf
+    presented = [ca["leaf_cert"], ca["ca_cert"], unrelated["ca_cert"]]
+    chain = tls_observer._build_verified_chain(
+        ca["leaf_cert"], presented, "localhost", str(ca["ca_pem"])
+    )
+    spkis = {_spki_of(c) for c in chain}
+    assert ca["leaf_spki"] in spkis
+    assert ca["ca_spki"] in spkis
+    assert unrelated["ca_spki"] not in spkis  # the appended cert was filtered out
+
+
+def test_build_verified_chain_fails_closed_on_untrusted_anchor(tmp_path):
+    # If the issuing CA is not a trust anchor, verification must fail closed.
+    ca = _make_ca_and_leaf(tmp_path)
+    other = _make_ca_and_leaf(tmp_path / "other")
+    with pytest.raises(tls_observer.TLSObserverError):
+        tls_observer._build_verified_chain(
+            ca["leaf_cert"], [ca["leaf_cert"], ca["ca_cert"]], "localhost", str(other["ca_pem"])
+        )
+
+
+def test_capture_chain_rejects_insecure(tmp_path):
+    cert_path, key_path, _ = _make_self_signed(tmp_path)
+    with pytest.raises(tls_observer.TLSObserverError):
+        tls_observer.observe_tls(
+            "127.0.0.1", 1, server_hostname="localhost", insecure=True, capture_chain=True, timeout=0.5
+        )
+
+
+def test_full_chain_missing_openssl_is_clean_error(tmp_path, monkeypatch):
+    def _boom(*a, **k):
+        raise FileNotFoundError("openssl")
+    monkeypatch.setattr(tls_observer.subprocess, "Popen", _boom)
+    cert_path, key_path, _ = _make_self_signed(tmp_path)
+    with _OneShotTLSServer(cert_path, key_path) as srv:
+        with pytest.raises(tls_observer.TLSObserverError):
+            _observe_bounded(
+                host="127.0.0.1", port=srv.port, server_hostname="localhost",
+                cafile=str(cert_path), capture_chain=True,
+            )
+
+
+def test_full_chain_timeout_is_clean_error(tmp_path, monkeypatch):
+    # Force select() to report no data so _run_bounded hits its deadline branch.
+    monkeypatch.setattr(tls_observer.select, "select", lambda *a, **k: ([], [], []))
+    cert_path, key_path, _ = _make_self_signed(tmp_path)
+    with _OneShotTLSServer(cert_path, key_path) as srv:
+        with pytest.raises(tls_observer.TLSObserverError):
+            _observe_bounded(
+                host="127.0.0.1", port=srv.port, server_hostname="localhost",
+                cafile=str(cert_path), capture_chain=True, timeout=1.0,
+            )
+
+
+def test_run_bounded_caps_stdout_size():
+    # A command that floods stdout must be truncated near the cap, not buffered
+    # without limit. `yes` streams forever; the bounded reader stops at the cap.
+    import shutil as _sh
+    if _sh.which("yes") is None:
+        pytest.skip("yes not available")
+    out, _ = tls_observer._run_bounded(["yes", "AAAAAAAA"], timeout=3.0)
+    assert len(out) <= tls_observer._MAX_OPENSSL_STDOUT + 1 + 65536
+
+
+def test_extract_pem_blocks_is_linear_and_bounded():
+    # many BEGIN markers with no END must not hang or over-collect
+    junk = (tls_observer._PEM_BEGIN + "\n") * 100000
+    assert tls_observer._extract_pem_blocks(junk, 16) == []
+    one = f"{tls_observer._PEM_BEGIN}\nAAAA\n{tls_observer._PEM_END}\n"
+    assert len(tls_observer._extract_pem_blocks(one * 50, 16)) == 16  # stops at the limit
+
+
+@pytest.mark.parametrize("bad", ["-connect", "", "a\nb", "x\x00y"])
+def test_safe_arg_rejects_option_like_or_control(bad):
+    with pytest.raises(tls_observer.TLSObserverError):
+        tls_observer._safe_arg(bad, "host")

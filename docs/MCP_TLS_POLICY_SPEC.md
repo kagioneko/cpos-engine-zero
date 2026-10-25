@@ -145,15 +145,31 @@ It never writes a TLS key log and refuses to run if `SSLKEYLOGFILE` is set, so
 `keylog_disabled` cannot be silently false. With `--insecure` it skips
 verification and therefore reports `hostname_matched: false` — a producer must
 never assert a match it did not make. `--timeout` bounds the TCP connect and
-handshake (DNS resolution is governed by the OS resolver). This reference
-producer reports the **leaf** only, so `chain_spki_sha256` carries the leaf
-certificate alone: the stdlib exposes no portable full-chain accessor, and
-shipping an untested version-specific one that could silently degrade would be
-worse than omitting it. Intermediate pinning
-(`pinned_intermediate_spki_sha256`) therefore needs a production producer that
-can expose the full chain (e.g. one built on a newer runtime's
-`get_unverified_chain` or on OpenSSL). The same trust boundary applies: CPOS's
-gate is only as strong as the producer that genuinely performed these checks.
+handshake (DNS resolution is governed by the OS resolver).
+
+By default it reports the **leaf** only, so `chain_spki_sha256` carries the leaf
+certificate alone: the stdlib exposes no portable full-chain accessor before
+Python 3.13. Pass `--full-chain` to populate `chain_spki_sha256` /
+`chain_issuers` with the full chain — this is what
+`pinned_intermediate_spki_sha256` needs:
+
+```
+python examples/tls_observer.py mcp.example.test 443 --full-chain > obs.json
+```
+
+Here openssl `s_client -showcerts` is used only to *fetch* the certificates the
+peer presents on the wire (which the stdlib cannot expose pre-3.13). That raw
+bag is not trusted: the producer then **cryptographically builds and verifies**
+the path from the handshake-verified leaf to a trust anchor and reports the
+SPKIs/issuers of that **verified path only**. A hostile server therefore cannot
+slip an unrelated appended CA's SPKI into `chain_spki_sha256` — a cert that is
+not on the valid path is never reported, so intermediate pinning over the
+reported chain cannot be fooled. Verification failure, an untrusted anchor,
+`--insecure` (incompatible), or openssl being missing/slow/erroring are all
+clean fail-closed errors, never a silent degrade to leaf-only; the fetch is
+bounded in time, output size, and certificate count. The same trust boundary
+applies: CPOS's gate is only as strong as the producer that genuinely performed
+these checks.
 
 ## Scope / non-goals
 
