@@ -16,6 +16,12 @@ def valid_definition(secret_file):
         "sensitivity_level": "internal",
         "requires_human_approval": True,
         "env_secret_files": {"GITHUB_TOKEN_FILE": str(secret_file)},
+        "tls_policy": {
+            "min_version": "TLSv1.2",
+            "pinned_spki_sha256": ["a" * 64],
+            "require_hostname_match": True,
+            "forbid_key_logging": True,
+        },
         "metadata": {"owner": "security"},
     }
 

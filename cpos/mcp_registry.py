@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import stat
 import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,6 +12,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
 from .hash_chain import append_chained_jsonl, read_jsonl, verify_hash_chain
+from .mcp_tls_policy import check_tls_policy_definition, verify_tls_observation
 from .pointer_os import utc_now
 
 VALID_TRANSPORTS = {"stdio", "https", "sse"}
@@ -42,6 +45,7 @@ class MCPConnector:
     env_secret_files: dict[str, str] = field(default_factory=dict)
     status: str = "active"
     created_at: str = field(default_factory=utc_now)
+    tls_policy: dict[str, Any] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -63,6 +67,7 @@ class MCPConnector:
             env_secret_files={str(k): str(v) for k, v in env_secret_files.items()} if isinstance(env_secret_files, dict) else env_secret_files,
             status=str(data.get("status", "active")),
             created_at=str(data.get("created_at") or utc_now()),
+            tls_policy=data.get("tls_policy"),
             metadata=data.get("metadata") or {},
         )
 
@@ -80,6 +85,7 @@ class MCPConnector:
             "env_secret_files": self.env_secret_files,
             "status": self.status,
             "created_at": self.created_at,
+            "tls_policy": self.tls_policy,
             "metadata": self.metadata,
         }
 
@@ -87,6 +93,44 @@ class MCPConnector:
 def load_definition_text(path: str | Path) -> dict[str, Any]:
     text = Path(path).read_text(encoding="utf-8")
     return json.loads(text)
+
+
+# Maximum bytes the CLI will read from an observation file. A TLS observation is
+# a small metadata object; anything larger is rejected rather than slurped.
+_MAX_OBSERVATION_BYTES = 256 * 1024
+
+
+def load_observation_file(path: str | Path) -> dict[str, Any]:
+    """Read a TLS observation JSON file for the CLI, with a bounded read.
+
+    Opened first with O_NONBLOCK, then validated by ``fstat`` on the *opened*
+    descriptor (not a pre-open ``stat`` on the path) so there is no stat/read
+    race: a non-regular target (FIFO/socket/device/dir) is rejected on the fd we
+    actually hold, and O_NONBLOCK keeps *opening* a FIFO from blocking (it does
+    not bound arbitrary filesystem latency on a regular file). The read is
+    bounded to ``_MAX_OBSERVATION_BYTES + 1`` bytes and any excess is rejected
+    *after* that bounded read but before decoding, so a file that grows after
+    opening cannot exhaust memory."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("observation path must be a regular file")
+        chunks: list[bytes] = []
+        remaining = _MAX_OBSERVATION_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
+    if len(data) > _MAX_OBSERVATION_BYTES:
+        raise ValueError("observation file is too large")
+    return json.loads(data.decode("utf-8"))
 
 
 def review_id_for(connector_id: str, timestamp: str) -> str:
@@ -160,6 +204,8 @@ def check_connector_definition(data: dict[str, Any]) -> dict[str, Any]:
                 findings.append(_finding("error", "shell_wrapper_blocked", "shell wrappers are blocked for MCP stdio definitions", "command[0]"))
         if connector.url:
             findings.append(_finding("warning", "stdio_url_ignored", "url is ignored for stdio transport", "url"))
+        if connector.tls_policy is not None:
+            findings.append(_finding("warning", "stdio_tls_policy_ignored", "tls_policy is ignored for stdio transport (no TLS connection)", "tls_policy"))
     else:
         if connector.command:
             findings.append(_finding("warning", "remote_command_ignored", "command is ignored for remote MCP transports", "command"))
@@ -190,6 +236,13 @@ def check_connector_definition(data: dict[str, Any]) -> dict[str, Any]:
                 if URL_QUERY_SECRET.search(q_name) and q_value.strip():
                     findings.append(_finding("warning", "url_query_secret_review", "a query parameter looks like a credential; put credentials in env_secret_files, not the URL", "url"))
                     break
+        # TLS policy is declarative here (no connection is made). Validate its
+        # shape if present; recommend declaring one otherwise. Runtime
+        # enforcement happens later via verify_tls_observation().
+        if connector.tls_policy is None:
+            findings.append(_finding("warning", "tls_policy_absent", "remote connector declares no tls_policy; SPKI pinning and a TLS floor are recommended", "tls_policy"))
+        else:
+            findings.extend(check_tls_policy_definition(connector.tls_policy))
 
     if not isinstance(connector.allowed_tools, list) or not connector.allowed_tools:
         findings.append(_finding("error", "allowed_tools_required", "allowed_tools must be an explicit non-empty allowlist", "allowed_tools"))
@@ -302,6 +355,25 @@ class MCPRegistry:
             "purpose": purpose,
         }
 
+    def verify_tls(self, connector_id: str, observation: dict[str, Any] | None, *, actor: str = "MCPRegistry") -> dict[str, Any]:
+        """Judge a TLS observation for a registered connector against its policy,
+        fail-closed, and audit the decision. CPOS does not open the connection;
+        the observation is supplied by whatever did."""
+        connector = next((item for item in self.load() if item.connector_id == connector_id), None)
+        if connector is None:
+            return {"ok": False, "decision": "tls_denied", "error": "connector_not_found", "connector_id": connector_id}
+        if connector.transport == "stdio":
+            return {"ok": False, "decision": "tls_not_applicable", "error": "tls_not_applicable_for_stdio", "connector_id": connector_id}
+        result = verify_tls_observation(connector, observation)
+        self.audit(
+            "tls_observation_verified",
+            actor=actor,
+            connector_id=connector_id,
+            decision=result["decision"],
+            metadata={"finding_codes": [f["code"] for f in result["findings"]], "ok": result["ok"]},
+        )
+        return {"connector_id": connector_id, **result}
+
     def submit_review(self, data: dict[str, Any], *, actor: str = "MCPRegistry") -> dict[str, Any]:
         result = self.check_definition(data, actor=actor)
         if not result["ok"]:
@@ -406,6 +478,11 @@ def build_parser() -> argparse.ArgumentParser:
     tool.add_argument("--purpose", default="cli_tool_check")
     tool.add_argument("--actor", default="MCPRegistryCLI")
     tool.add_argument("--json", action="store_true")
+    verify_tls = sub.add_parser("verify-tls")
+    verify_tls.add_argument("connector_id")
+    verify_tls.add_argument("observation", help="path to a JSON file holding the TLS observation metadata")
+    verify_tls.add_argument("--actor", default="MCPRegistryCLI")
+    verify_tls.add_argument("--json", action="store_true")
     submit = sub.add_parser("submit-review")
     submit.add_argument("definition")
     submit.add_argument("--actor", default="MCPRegistryCLI")
@@ -468,6 +545,17 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "check-tool":
         result = registry.evaluate_tool_call(args.connector_id, args.tool_name, actor=args.actor, purpose=args.purpose)
+        _print(result, as_json=args.json)
+        if not result.get("ok"):
+            raise SystemExit(1)
+        return
+    if args.command == "verify-tls":
+        try:
+            observation = load_observation_file(args.observation)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            _print({"ok": False, "decision": "tls_denied", "error": "observation_unreadable", "detail": type(exc).__name__}, as_json=args.json)
+            raise SystemExit(1)
+        result = registry.verify_tls(args.connector_id, observation, actor=args.actor)
         _print(result, as_json=args.json)
         if not result.get("ok"):
             raise SystemExit(1)
