@@ -20,9 +20,9 @@ AIコーディングエージェント（GitHub Copilot、Claude Code、Hermes�
 
 Engine-Zero を構成するコア技術は大きく分けて以下の3つです。
 
-### ① 承認と実行の完全な分離 (Separated Execution Gate)
+### ① 承認と実行の完全な分離 (Separated Execution Gate — Approval separated from execution)
 *   **メタデータ限定の永続化 (Metadata-only persistence)**:
-    エージェントがSandbox内でテストを実行したり、パッチ（コードの差分）を生成したりした際、生のコード、ログ、環境変数は一切ダッシュボードやレポート用データベース（Task Tape）に永続化しません。ハッシュ値や成功・失敗のメタデータのみを保存し、リークを防ぎます。
+    エージェントがSandbox内でテストを実行したり、パッチ（コードの差分）を生成したりした際、生のコード、ログ、環境変数をダッシュボードやレポート用の永続面（Task Tape）に残しません。これらの表示・レポート面には raw diffs, raw stdout/stderr や機密情報を出さず、ハッシュ値・サイズ・成否などのメタデータのみを提示してリークを防ぎます。
 *   **人間による最終実行ゲート (Ready-to-Run Gate)**:
     エージェントが自律的にコードを書き換えてテストが通ったとしても、最終的な本番リポジトリへの適用やPR作成には、人間がキュー（Human Escalation Queue）を通じてパッチを明示的に承認する必要があります。
 
@@ -42,8 +42,8 @@ Engine-Zero を構成するコア技術は大きく分けて以下の3つです�
 
 ## 🚀 3. ハッカソン用のアピールポイント（ピッチでの魅せ方）
 
-1.  **「Safer-by-Design」な自律開発の提案**:
-    多くのハッカソン作品が「どれだけ高度なコードを書けるか」を競う中、この作品は「**どれだけ安全かつ管理可能（ガバナンス可能）にAIを組織で動かせるか**」にフォーカスしています。エンタープライズや規制の厳しい業界（金融、医療、インフラなど）でAIエージェントを採用する際の最大のボトルネックを解消します。
+1.  **「Safer-by-Design」な自律開発の提案 (Positioning vs. Hermes / OpenClaw / Claude Code-style agents)**:
+    多くのハッカソン作品が「どれだけ高度なコードを書けるか」を競う中、この作品は「**どれだけ安全かつ管理可能（ガバナンス可能）にAIを組織で動かせるか**」にフォーカスしています。Hermes / OpenClaw / Claude Code-style agents と比較した際の立ち位置として、書き込み権限の広さで競うのではなく、監査性・明示的な承認境界・Sandbox優先実行・メタデータ限定永続化を重視する設計方針を取っています。エンタープライズや規制の厳しい業界（金融、医療、インフラなど）でAIエージェントを採用する際の最大のボトルネックを解消します。
 2.  **実証済みの高い防御力と実用性の両立**:
     CPOS v12.0 カーネルへの統合により、全265件のテストスイート（回帰テスト）をパスし、通常の開発サイクルを邪魔せずに堅牢なプロンプト防御とデータ隠蔽が実現できていることを示せます。
 3.  **Google Cloud へのデリバリー**:
@@ -53,11 +53,11 @@ Engine-Zero を構成するコア技術は大きく分けて以下の3つです�
 
 ## 💻 4. デモとダッシュボード
 
-### ① Readinessのワンコマンド確認
+### ① Readinessのワンコマンド確認 (Competitive Demo Readiness)
 ```bash
 curl https://<host>/demo/readiness
 ```
-Fast Resume、Human Escalation Queue、Patch Validation、Sandbox Flow Graphなど、すべての安全レイヤーが稼働状態（Ready）であることを一括で検証します。
+Fast Resume、Human Escalation、Patch Generation、Validation Harness、Ready-to-Run Gate、Flow Graph、Report など、すべての安全レイヤーがデモ稼働状態（Ready）であることを一括で検証します。
 
 ### ② ダミーデモデータの自動生成 (Metadata-only Fixture)
 ```bash
