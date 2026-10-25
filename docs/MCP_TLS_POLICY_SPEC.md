@@ -178,6 +178,19 @@ bounded in time, output size, and certificate count. The same trust boundary
 applies: CPOS's gate is only as strong as the producer that genuinely performed
 these checks.
 
+The OCSP observation fields (`ocsp_status` etc. for `require_ocsp_staple`) must
+likewise come from a *verified* OCSP response, never from scraping a tool's
+printed status (which is spoofable). `examples/ocsp_verify.py` verifies a DER
+OCSP response with `cryptography.x509.ocsp` before reporting any status: the
+response status is successful, its signature is valid and issuer-direct (its
+algorithm matching the issuer key family), the responderID names that issuer,
+its CertID matches the exact leaf/issuer, it carries no unhandled critical
+extension, and it is temporally valid — otherwise it fails closed. A response
+carrying a delegated responder certificate is rejected: validating a delegated
+responder is a full X.509 path-validation problem left to a dedicated layer.
+Fetching the DER response over the network (parsing the leaf's AIA OCSP URL and
+POSTing an OCSP request) is likewise a thin layer on top and is not yet included.
+
 ## Scope / non-goals
 
 - CPOS still does not connect. Producing a real observation (doing the TLS
