@@ -5,7 +5,8 @@ wired into both runtime gates, now with leaf **and** intermediate (issuing-CA)
 SPKI pinning. `request_mcp_execution` and `request_mcp_capability_probe` each
 consult a TLS observation for a remote connector that declares a `tls_policy`:
 a missing or policy-failing observation denies the request fail-closed (see
-"Runtime gates" below). CPOS still never opens a socket.
+"Runtime gates" below). CPOS still never opens a socket; a reference *producer*
+that does (`examples/tls_observer.py`) lives outside the package.
 
 ## Why
 
@@ -127,11 +128,40 @@ runs the tool, never starts a server, and never opens the socket):
 - HTTP: `POST /mcp/executions/dry-run` and `POST /mcp/probes/dry-run` each
   accept an optional `tls_observation` object alongside the usual fields.
 
+## Producing an observation (outside CPOS)
+
+`examples/tls_observer.py` is a reference *producer*: it opens a socket, performs
+the TLS handshake with the stdlib `ssl`, and extracts the SPKI hashes, issuer
+names, and expiry with `cryptography`, emitting an observation JSON in exactly
+the shape above. CPOS never runs this itself — it lives in `examples/` precisely
+because it connects. Its output pipes straight into `verify-tls`:
+
+```
+python examples/tls_observer.py mcp.example.test 443 > obs.json
+python -m cpos.mcp_registry verify-tls <connector_id> obs.json
+```
+
+It never writes a TLS key log and refuses to run if `SSLKEYLOGFILE` is set, so
+`keylog_disabled` cannot be silently false. With `--insecure` it skips
+verification and therefore reports `hostname_matched: false` — a producer must
+never assert a match it did not make. `--timeout` bounds the TCP connect and
+handshake (DNS resolution is governed by the OS resolver). This reference
+producer reports the **leaf** only, so `chain_spki_sha256` carries the leaf
+certificate alone: the stdlib exposes no portable full-chain accessor, and
+shipping an untested version-specific one that could silently degrade would be
+worse than omitting it. Intermediate pinning
+(`pinned_intermediate_spki_sha256`) therefore needs a production producer that
+can expose the full chain (e.g. one built on a newer runtime's
+`get_unverified_chain` or on OpenSSL). The same trust boundary applies: CPOS's
+gate is only as strong as the producer that genuinely performed these checks.
+
 ## Scope / non-goals
 
 - CPOS still does not connect. Producing a real observation (doing the TLS
   handshake, computing the SPKI hash, confirming the key log is off) is the job
-  of the executing component, not CPOS.
+  of the executing component, not CPOS. A reference producer lives at
+  `examples/tls_observer.py` (see "Producing an observation" below) — it is
+  deliberately *outside* the CPOS package because it opens a socket.
 - Revocation (CRL/OCSP) is not checked here; `forbidden_issuers` is a coarse,
   operator-driven block for known-bad CAs, not a revocation service.
 - Full-chain policy covers issuer-name matching, leaf SPKI pinning, and
