@@ -1,8 +1,8 @@
 # MCP TLS Policy & Observation Checking
 
-Status: round 4 — declarative policy + fail-closed verification **primitive**,
-wired into both runtime gates, now with leaf **and** intermediate (issuing-CA)
-SPKI pinning. `request_mcp_execution` and `request_mcp_capability_probe` each
+Status: round 5 — declarative policy + fail-closed verification **primitive**,
+wired into both runtime gates, with leaf **and** intermediate (issuing-CA) SPKI
+pinning and producer-asserted OCSP revocation gating. `request_mcp_execution` and `request_mcp_capability_probe` each
 consult a TLS observation for a remote connector that declares a `tls_policy`:
 a missing or policy-failing observation denies the request fail-closed (see
 "Runtime gates" below). CPOS still never opens a socket; a reference *producer*
@@ -54,6 +54,8 @@ Remote transports only (`https`, `sse`). Ignored for `stdio` (warned).
 | `forbidden_issuers` | list[str] | none | Issuer `O`/`CN` names to reject anywhere in the chain (e.g. a revoked CA). Exact, case-insensitive name match — operator supplies the exact name, no substring heuristics. |
 | `require_hostname_match` | bool | `true` | The observation must assert the certificate matched the host. |
 | `forbid_key_logging` | bool | `true` | The observation must assert no TLS key log was written. |
+| `require_ocsp_staple` | bool | `false` | The observation must assert a stapled OCSP response with a `good` status. Opt-in, since not every endpoint staples. |
+| `max_ocsp_staple_age_seconds` | int | none | When set (with `require_ocsp_staple`), the staple's `ocsp_produced_at` must be within this age and its `ocsp_next_update` must not be in the past. |
 
 A remote connector with no `tls_policy` is accepted but **warned**
 (`tls_policy_absent`) — pinning and a floor are recommended.
@@ -69,7 +71,11 @@ A remote connector with no `tls_policy` is accepted but **warned**
   "leaf_not_after": "2026-12-31T23:59:59Z",
   "hostname_matched": true,
   "keylog_disabled": true,
-  "observed_host": "mcp.example.test"
+  "observed_host": "mcp.example.test",
+  "ocsp_stapled": true,
+  "ocsp_status": "good",
+  "ocsp_produced_at": "2026-10-25T00:00:00Z",
+  "ocsp_next_update": "2026-10-26T00:00:00Z"
 }
 ```
 
@@ -83,6 +89,7 @@ Fail-closed rules:
 - Policy forbids issuers but the chain is missing/malformed/oversized → `tls_chain_malformed`; well-formed but empty → `tls_chain_issuers_missing`; a forbidden issuer present → `tls_issuer_forbidden` (all deny). A malformed chain is denied, never skipped, so it cannot hide a forbidden issuer.
 - `require_hostname_match`: `hostname_matched` not exactly `true` → `tls_hostname_unverified`; a missing/ill-typed `observed_host` → `tls_observed_host_missing`; a connector URL with no host → `tls_expected_host_unknown`; `observed_host` ≠ URL host → `tls_host_divergence` (all deny). The asserted flag alone is not enough — a valid `observed_host` matching the connector URL host is also required.
 - `forbid_key_logging` and `keylog_disabled` not exactly `true` → `tls_keylog_not_disabled` (deny).
+- Revocation (OCSP staple asserted by the producer; CPOS never fetches OCSP/CRL itself): an `ocsp_status` of `revoked` → `tls_certificate_revoked` (deny) **always**, even without `require_ocsp_staple` — a producer-reported revocation is never overridden. With `require_ocsp_staple`: a missing/false `ocsp_stapled` → `tls_ocsp_staple_required`; a status that is not `good` (unknown/missing) → `tls_ocsp_status_not_good`. With `max_ocsp_staple_age_seconds` set: a missing/unparseable `ocsp_produced_at` → `tls_ocsp_produced_at_missing`; one more than a small clock-skew in the future → `tls_ocsp_produced_at_in_future`; one older than the max → `tls_ocsp_staple_stale`; an `ocsp_next_update` that is present but unparseable → `tls_ocsp_next_update_invalid`, or in the past → `tls_ocsp_staple_expired` (all deny). At definition time a non-bool `require_ocsp_staple` → `tls_flag_invalid`, a non-positive-int `max_ocsp_staple_age_seconds` → `tls_ocsp_max_age_invalid`.
 - Expired leaf → `tls_certificate_expired` (deny). Expiry absent/unparseable → warning only (`tls_expiry_unknown` / `tls_expiry_unparseable`): CPOS flags that it could not verify expiry rather than assuming either way.
 - Finding messages never echo observation-supplied values (hosts, issuer names); they name the offending field by its structured path only.
 
@@ -178,7 +185,10 @@ these checks.
   of the executing component, not CPOS. A reference producer lives at
   `examples/tls_observer.py` (see "Producing an observation" below) — it is
   deliberately *outside* the CPOS package because it opens a socket.
-- Revocation (CRL/OCSP) is not checked here; `forbidden_issuers` is a coarse,
+- Revocation: CPOS does not fetch CRL/OCSP (it never connects). It can gate a
+  revocation result the *producer* staples and asserts (`require_ocsp_staple` /
+  `max_ocsp_staple_age_seconds`, and a `revoked` status always denies), but it
+  cannot discover revocation on its own. `forbidden_issuers` remains a coarse,
   operator-driven block for known-bad CAs, not a revocation service.
 - Full-chain policy covers issuer-name matching, leaf SPKI pinning, and
   intermediate (issuing-CA) SPKI pinning. It still matches a producer-reported

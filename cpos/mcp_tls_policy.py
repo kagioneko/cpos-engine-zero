@@ -43,6 +43,10 @@ _MAX_HOST_LEN = 253  # DNS name maximum
 DEFAULT_MIN_VERSION = "TLSv1.2"
 DEFAULT_REQUIRE_HOSTNAME_MATCH = True
 DEFAULT_FORBID_KEY_LOGGING = True
+DEFAULT_REQUIRE_OCSP_STAPLE = False
+# Clock-skew tolerance for an OCSP staple's produced_at: a little in the future
+# is normal clock drift, far in the future is not a staple we should trust.
+_OCSP_SKEW_SECONDS = 300
 
 _KNOWN_POLICY_KEYS = {
     "min_version",
@@ -51,6 +55,8 @@ _KNOWN_POLICY_KEYS = {
     "forbidden_issuers",
     "require_hostname_match",
     "forbid_key_logging",
+    "require_ocsp_staple",
+    "max_ocsp_staple_age_seconds",
 }
 
 
@@ -147,6 +153,7 @@ def parse_tls_policy(policy: Any) -> dict[str, Any]:
     pins = policy.get("pinned_spki_sha256") or []
     inter = policy.get("pinned_intermediate_spki_sha256") or []
     forbidden = policy.get("forbidden_issuers") or []
+    max_age = policy.get("max_ocsp_staple_age_seconds")
     return {
         "min_version": _normalize_version(policy.get("min_version")) or DEFAULT_MIN_VERSION,
         "pinned_spki_sha256": [str(p).strip().lower() for p in pins] if isinstance(pins, list) else [],
@@ -154,6 +161,10 @@ def parse_tls_policy(policy: Any) -> dict[str, Any]:
         "forbidden_issuers": [str(i).strip().casefold() for i in forbidden if str(i).strip()] if isinstance(forbidden, list) else [],
         "require_hostname_match": bool(policy.get("require_hostname_match", DEFAULT_REQUIRE_HOSTNAME_MATCH)),
         "forbid_key_logging": bool(policy.get("forbid_key_logging", DEFAULT_FORBID_KEY_LOGGING)),
+        "require_ocsp_staple": bool(policy.get("require_ocsp_staple", DEFAULT_REQUIRE_OCSP_STAPLE)),
+        # Only a positive int (never a bool) is a meaningful max age; anything
+        # else means "no freshness bound".
+        "max_ocsp_staple_age_seconds": max_age if isinstance(max_age, int) and not isinstance(max_age, bool) and max_age > 0 else None,
     }
 
 
@@ -208,9 +219,14 @@ def check_tls_policy_definition(policy: Any) -> list[dict[str, str]]:
         if not isinstance(forbidden, list) or any(not isinstance(i, str) or not i.strip() for i in forbidden):
             findings.append(_finding("error", "tls_forbidden_issuers_invalid", "forbidden_issuers must be a list of non-empty issuer O/CN strings", "tls_policy.forbidden_issuers"))
 
-    for flag in ("require_hostname_match", "forbid_key_logging"):
+    for flag in ("require_hostname_match", "forbid_key_logging", "require_ocsp_staple"):
         if flag in policy and not isinstance(policy.get(flag), bool):
             findings.append(_finding("error", "tls_flag_invalid", f"{flag} must be a boolean", f"tls_policy.{flag}"))
+
+    if "max_ocsp_staple_age_seconds" in policy:
+        max_age = policy.get("max_ocsp_staple_age_seconds")
+        if isinstance(max_age, bool) or not isinstance(max_age, int) or max_age <= 0:
+            findings.append(_finding("error", "tls_ocsp_max_age_invalid", "max_ocsp_staple_age_seconds must be a positive integer number of seconds", "tls_policy.max_ocsp_staple_age_seconds"))
 
     return findings
 
@@ -232,6 +248,9 @@ def verify_tls_observation(connector: Any, observation: Any, *, connector_url: s
       - ``hostname_matched``: bool, cert matched the host
       - ``keylog_disabled``: bool, no TLS key log was written
       - ``observed_host``: the host actually connected to
+      - ``ocsp_stapled``: bool, an OCSP response was stapled to the handshake
+      - ``ocsp_status``: "good" / "revoked" / "unknown" (producer's OCSP result)
+      - ``ocsp_produced_at`` / ``ocsp_next_update``: ISO-8601 staple timestamps
     """
     raw_policy = _attr(connector, "tls_policy")
     url = connector_url if connector_url is not None else _attr(connector, "url")
@@ -327,6 +346,48 @@ def verify_tls_observation(connector: Any, observation: Any, *, connector_url: s
             findings.append(_finding("warning", "tls_expiry_unparseable", "leaf_not_after is not a parseable ISO-8601 timestamp", "observation.leaf_not_after"))
         elif not_after <= datetime.now(timezone.utc):
             findings.append(_finding("error", "tls_certificate_expired", "leaf certificate is expired", "observation.leaf_not_after"))
+
+    # --- revocation (OCSP staple assertion from the producer) ---
+    # A revoked status is ALWAYS fatal, even when the policy does not require a
+    # staple: if the producer went to the trouble of telling us the cert is
+    # revoked, never proceed. Requiring a staple additionally demands a fresh
+    # "good" status. CPOS does not fetch OCSP/CRL itself (it never connects);
+    # this governs a revocation result the producer asserts.
+    now = datetime.now(timezone.utc)
+    ocsp_status = observation.get("ocsp_status")
+    if ocsp_status == "revoked":
+        findings.append(_finding("error", "tls_certificate_revoked", "observation reports the certificate as revoked (OCSP)", "observation.ocsp_status"))
+
+    if policy["require_ocsp_staple"]:
+        if observation.get("ocsp_stapled") is not True:
+            findings.append(_finding("error", "tls_ocsp_staple_required", "policy requires a stapled OCSP response but observation does not assert ocsp_stapled is true", "observation.ocsp_stapled"))
+        elif ocsp_status != "good":
+            # "revoked" is already flagged above; here catch unknown/missing/ill-typed.
+            if ocsp_status != "revoked":
+                findings.append(_finding("error", "tls_ocsp_status_not_good", "policy requires a good OCSP status but the stapled status is missing, unknown, or unrecognized", "observation.ocsp_status"))
+        else:
+            # status is good; enforce freshness if a max age is set.
+            max_age = policy["max_ocsp_staple_age_seconds"]
+            if max_age is not None:
+                produced = _parse_iso(observation.get("ocsp_produced_at"))
+                if produced is None:
+                    findings.append(_finding("error", "tls_ocsp_produced_at_missing", "a max OCSP staple age is set but observation has no parseable ocsp_produced_at", "observation.ocsp_produced_at"))
+                else:
+                    age = (now - produced).total_seconds()
+                    if age < -_OCSP_SKEW_SECONDS:
+                        # Produced well in the future -> not a staple we trust; a
+                        # negative age must never slip past the max-age check.
+                        findings.append(_finding("error", "tls_ocsp_produced_at_in_future", "ocsp_produced_at is in the future beyond clock-skew tolerance", "observation.ocsp_produced_at"))
+                    elif age > max_age:
+                        findings.append(_finding("error", "tls_ocsp_staple_stale", "stapled OCSP response is older than the policy maximum", "observation.ocsp_produced_at"))
+                # next_update is optional, but if PRESENT it must be valid: a
+                # malformed value must deny, not be silently ignored.
+                if "ocsp_next_update" in observation:
+                    next_update = _parse_iso(observation.get("ocsp_next_update"))
+                    if next_update is None:
+                        findings.append(_finding("error", "tls_ocsp_next_update_invalid", "ocsp_next_update is present but not a parseable ISO-8601 timestamp", "observation.ocsp_next_update"))
+                    elif next_update <= now:
+                        findings.append(_finding("error", "tls_ocsp_staple_expired", "stapled OCSP response is past its next_update", "observation.ocsp_next_update"))
 
     ok = not any(f["severity"] == "error" for f in findings)
     return {"ok": ok, "decision": "tls_allowed" if ok else "tls_denied", "findings": findings, "policy": policy}

@@ -622,3 +622,140 @@ def test_verify_empty_intermediate_pins_ignore_bad_chain():
     obs["chain_spki_sha256"] = "garbage"
     result = verify_tls_observation(connector(policy), obs)
     assert result["ok"] is True
+
+
+# --------------------------------------------------------------------------- #
+# CPOS②: OCSP revocation (producer-asserted, policy-gated, fail-closed)
+# --------------------------------------------------------------------------- #
+
+def _past_iso(seconds: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def test_check_policy_validates_ocsp_fields():
+    assert check_tls_policy_definition({**good_policy(), "require_ocsp_staple": True, "max_ocsp_staple_age_seconds": 3600}) == []
+    bad_flag = {f["code"] for f in check_tls_policy_definition({**good_policy(), "require_ocsp_staple": "yes"})}
+    assert "tls_flag_invalid" in bad_flag
+    for bad_age in (0, -1, True, 3.5, "60"):
+        codes = {f["code"] for f in check_tls_policy_definition({**good_policy(), "max_ocsp_staple_age_seconds": bad_age})}
+        assert "tls_ocsp_max_age_invalid" in codes, bad_age
+
+
+def test_parse_normalizes_ocsp_policy():
+    eff = parse_tls_policy({**good_policy(), "require_ocsp_staple": True, "max_ocsp_staple_age_seconds": 120})
+    assert eff["require_ocsp_staple"] is True
+    assert eff["max_ocsp_staple_age_seconds"] == 120
+    # absent / bad age -> None, flag defaults False
+    eff2 = parse_tls_policy(good_policy())
+    assert eff2["require_ocsp_staple"] is False
+    assert eff2["max_ocsp_staple_age_seconds"] is None
+    assert parse_tls_policy({"max_ocsp_staple_age_seconds": True})["max_ocsp_staple_age_seconds"] is None
+
+
+def test_revoked_status_always_denies_even_without_require():
+    # No require_ocsp_staple, but a revoked assertion must still deny.
+    obs = good_observation()
+    obs["ocsp_status"] = "revoked"
+    result = verify_tls_observation(connector(good_policy()), obs)
+    assert result["ok"] is False
+    assert "tls_certificate_revoked" in {f["code"] for f in result["findings"]}
+
+
+def test_good_observation_without_ocsp_passes_when_not_required():
+    # Backward-compat: default policy does not require OCSP.
+    assert verify_tls_observation(connector(good_policy()), good_observation())["ok"] is True
+
+
+def test_require_staple_denies_when_absent():
+    policy = {**good_policy(), "require_ocsp_staple": True}
+    result = verify_tls_observation(connector(policy), good_observation())  # no ocsp fields
+    assert result["ok"] is False
+    assert "tls_ocsp_staple_required" in {f["code"] for f in result["findings"]}
+
+
+def test_require_staple_denies_on_unknown_status():
+    policy = {**good_policy(), "require_ocsp_staple": True}
+    obs = {**good_observation(), "ocsp_stapled": True, "ocsp_status": "unknown"}
+    result = verify_tls_observation(connector(policy), obs)
+    assert result["ok"] is False
+    assert "tls_ocsp_status_not_good" in {f["code"] for f in result["findings"]}
+
+
+def test_require_staple_passes_on_good_fresh():
+    policy = {**good_policy(), "require_ocsp_staple": True, "max_ocsp_staple_age_seconds": 3600}
+    obs = {**good_observation(), "ocsp_stapled": True, "ocsp_status": "good",
+           "ocsp_produced_at": _past_iso(60), "ocsp_next_update": _future_iso(1)}
+    result = verify_tls_observation(connector(policy), obs)
+    assert result["ok"] is True, result["findings"]
+
+
+def test_require_staple_denies_on_stale_produced_at():
+    policy = {**good_policy(), "require_ocsp_staple": True, "max_ocsp_staple_age_seconds": 300}
+    obs = {**good_observation(), "ocsp_stapled": True, "ocsp_status": "good",
+           "ocsp_produced_at": _past_iso(3600)}  # older than 300s
+    result = verify_tls_observation(connector(policy), obs)
+    assert result["ok"] is False
+    assert "tls_ocsp_staple_stale" in {f["code"] for f in result["findings"]}
+
+
+def test_require_staple_denies_when_produced_at_missing_but_age_required():
+    policy = {**good_policy(), "require_ocsp_staple": True, "max_ocsp_staple_age_seconds": 300}
+    obs = {**good_observation(), "ocsp_stapled": True, "ocsp_status": "good"}  # no produced_at
+    result = verify_tls_observation(connector(policy), obs)
+    assert result["ok"] is False
+    assert "tls_ocsp_produced_at_missing" in {f["code"] for f in result["findings"]}
+
+
+def test_require_staple_denies_on_expired_next_update():
+    policy = {**good_policy(), "require_ocsp_staple": True, "max_ocsp_staple_age_seconds": 3600}
+    obs = {**good_observation(), "ocsp_stapled": True, "ocsp_status": "good",
+           "ocsp_produced_at": _past_iso(60), "ocsp_next_update": _past_iso(1)}  # already past
+    result = verify_tls_observation(connector(policy), obs)
+    assert result["ok"] is False
+    assert "tls_ocsp_staple_expired" in {f["code"] for f in result["findings"]}
+
+
+def test_require_staple_denies_on_future_produced_at():
+    # a produced_at far in the future gives a negative age and must not sneak
+    # past the max-age check.
+    policy = {**good_policy(), "require_ocsp_staple": True, "max_ocsp_staple_age_seconds": 3600}
+    future = (datetime.now(timezone.utc) + timedelta(days=365)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    obs = {**good_observation(), "ocsp_stapled": True, "ocsp_status": "good", "ocsp_produced_at": future}
+    result = verify_tls_observation(connector(policy), obs)
+    assert result["ok"] is False
+    assert "tls_ocsp_produced_at_in_future" in {f["code"] for f in result["findings"]}
+
+
+@pytest.mark.parametrize("bad_next", ["not-a-date", True, 123, "2026-13-99T99:99:99Z"])
+def test_require_staple_denies_on_malformed_next_update(bad_next):
+    # a present-but-invalid next_update must deny, not be silently ignored.
+    policy = {**good_policy(), "require_ocsp_staple": True, "max_ocsp_staple_age_seconds": 3600}
+    obs = {**good_observation(), "ocsp_stapled": True, "ocsp_status": "good",
+           "ocsp_produced_at": _past_iso(60), "ocsp_next_update": bad_next}
+    result = verify_tls_observation(connector(policy), obs)
+    assert result["ok"] is False
+    assert "tls_ocsp_next_update_invalid" in {f["code"] for f in result["findings"]}
+
+
+def test_require_staple_small_future_skew_tolerated():
+    # a produced_at slightly in the future (clock drift) within skew is allowed.
+    policy = {**good_policy(), "require_ocsp_staple": True, "max_ocsp_staple_age_seconds": 3600}
+    near_future = (datetime.now(timezone.utc) + timedelta(seconds=30)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    obs = {**good_observation(), "ocsp_stapled": True, "ocsp_status": "good", "ocsp_produced_at": near_future}
+    assert verify_tls_observation(connector(policy), obs)["ok"] is True
+
+
+def test_require_staple_no_age_bound_passes_on_good_without_timestamps():
+    # require staple but no max age -> good status alone suffices.
+    policy = {**good_policy(), "require_ocsp_staple": True}
+    obs = {**good_observation(), "ocsp_stapled": True, "ocsp_status": "good"}
+    assert verify_tls_observation(connector(policy), obs)["ok"] is True
+
+
+def test_ocsp_findings_do_not_echo_observation_values():
+    policy = {**good_policy(), "require_ocsp_staple": True, "max_ocsp_staple_age_seconds": 300}
+    obs = {**good_observation(), "ocsp_stapled": True, "ocsp_status": "good", "ocsp_produced_at": _past_iso(9999)}
+    result = verify_tls_observation(connector(policy), obs)
+    assert result["ok"] is False
+    # the observation-supplied timestamp must not be echoed into finding messages
+    assert obs["ocsp_produced_at"] not in json.dumps(result["findings"])
