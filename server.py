@@ -1460,12 +1460,18 @@ def mcp_execution_dry_run():
         connector_id=str(connector_id),
         tool_name=str(tool_name),
         arguments=data.get('arguments') or {},
+        tls_observation=data.get('tls_observation'),
         actor=request_actor(),
         purpose=data.get('purpose') or 'http_mcp_dry_run',
         dry_run=data.get('dry_run', True) is not False,
     )
     status = 200 if result.get('ok') else 400
-    audit_security_event('security_mutation', 'mcp_execution_dry_run_requested' if result.get('ok') else result.get('error', 'mcp_execution_dry_run_denied'), status, required_scope_for_request(), {'connector_id': connector_id, 'tool_name': tool_name, 'task_id': result.get('task_id'), 'decision': (result.get('decision') or {}).get('decision')})
+    # ``decision`` may be the evaluate_tool_call dict (allowed/approval_required)
+    # or a plain string label (e.g. a tool-gate reason, or the TLS-gate
+    # "tls_denied"); normalize both without assuming a dict.
+    decision_val = result.get('decision')
+    decision_label = decision_val.get('decision') if isinstance(decision_val, dict) else decision_val
+    audit_security_event('security_mutation', 'mcp_execution_dry_run_requested' if result.get('ok') else result.get('error', 'mcp_execution_dry_run_denied'), status, required_scope_for_request(), {'connector_id': connector_id, 'tool_name': tool_name, 'task_id': result.get('task_id'), 'decision': decision_label})
     return jsonify(result), status
 
 

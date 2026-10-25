@@ -328,6 +328,10 @@ class MCPRegistry:
                 return {"ok": True, "connector": connector.to_dict()}
         return {"ok": False, "error": "connector_not_found", "connector_id": connector_id}
 
+    def get_connector(self, connector_id: str) -> MCPConnector | None:
+        """Return the registered connector, or None. Metadata only."""
+        return next((item for item in self.load() if item.connector_id == connector_id), None)
+
     def evaluate_tool_call(self, connector_id: str, tool_name: str, *, actor: str = "MCPRegistry", purpose: str = "tool_check") -> dict[str, Any]:
         connector = next((item for item in self.load() if item.connector_id == connector_id), None)
         if connector is None:

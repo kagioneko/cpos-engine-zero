@@ -48,6 +48,62 @@ def _target(connector_id: str, tool_name: str) -> str:
     return f"mcp://execution/{safe_connector}/{safe_tool}"
 
 
+def _tls_finding_codes(result: dict[str, Any]) -> list[str]:
+    """Structured finding codes only — never observation-supplied values."""
+    return [f.get("code") for f in result.get("findings", []) if isinstance(f, dict) and f.get("code")]
+
+
+def _check_tls_gate(
+    registry: MCPRegistry,
+    connector_id: str,
+    tls_observation: dict[str, Any] | None,
+    *,
+    actor: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Evaluate the fail-closed TLS gate for a tool-execution request.
+
+    Returns ``(deny, summary)``:
+      - ``deny`` is a response dict when the request must be denied, else None.
+      - ``summary`` is a metadata-only verification summary (finding codes + ok,
+        no observation values) to attach to the dry-run payload, else None.
+
+    The gate applies ONLY to a remote (non-stdio) connector that declares a
+    ``tls_policy``. CPOS does not open the connection; this judges the
+    producer-supplied observation against the connector's declared policy.
+    """
+    connector = registry.get_connector(connector_id)
+    if connector is None:
+        # evaluate_tool_call already resolved the connector, so this is
+        # unexpected; fail closed rather than silently proceed.
+        registry.audit("execution_request_denied", actor=actor, connector_id=connector_id, decision="connector_not_found", metadata={"stage": "tls_gate"})
+        return ({"ok": False, "error": "connector_not_found", "connector_id": connector_id, "execute_automatically": False, "tool_executed": False}, None)
+
+    if getattr(connector, "transport", None) == "stdio" or connector.tls_policy is None:
+        return (None, None)  # no TLS gate applies
+
+    if tls_observation is None:
+        registry.audit("execution_request_denied", actor=actor, connector_id=connector_id, decision="tls_observation_required", metadata={"tls_policy_declared": True})
+        return (
+            {"ok": False, "error": "tls_observation_required", "decision": "tls_denied", "execute_automatically": False, "tool_executed": False},
+            None,
+        )
+
+    result = registry.verify_tls(connector_id, tls_observation, actor=actor)
+    codes = _tls_finding_codes(result)
+    if not result.get("ok"):
+        # Audit the gate denial at the execution layer uniformly. verify_tls
+        # audits the policy decision when it can, but its own early returns (e.g.
+        # the connector disappearing between get_connector() and verify_tls()'s
+        # reload) do not, so without this a denial could leave only a
+        # tool_call_evaluated row. Fail-closed denials must always be auditable.
+        registry.audit("execution_request_denied", actor=actor, connector_id=connector_id, decision="tls_execution_blocked", metadata={"tls_finding_codes": codes, "tls_decision": result.get("decision")})
+        return (
+            {"ok": False, "error": "tls_execution_blocked", "decision": result.get("decision", "tls_denied"), "tls_finding_codes": codes, "execute_automatically": False, "tool_executed": False},
+            None,
+        )
+    return (None, {"ok": True, "decision": result.get("decision"), "finding_codes": codes})
+
+
 def request_mcp_execution(
     registry: MCPRegistry,
     task_tape: TaskTapeStore,
@@ -55,6 +111,7 @@ def request_mcp_execution(
     connector_id: str,
     tool_name: str,
     arguments: dict[str, Any] | None = None,
+    tls_observation: dict[str, Any] | None = None,
     actor: str = "MCPExecutionAdapter",
     purpose: str = "mcp_execution_request",
     dry_run: bool = True,
@@ -63,6 +120,13 @@ def request_mcp_execution(
 
     This adapter is intentionally metadata-only: it never launches an MCP server,
     never sends arguments to a connector, and never stores raw argument values.
+
+    ``tls_observation`` is optional transport-handshake metadata supplied by
+    whatever actually performed (or would perform) the connection. For a remote
+    (non-stdio) connector that declares a ``tls_policy``, the request is gated
+    fail-closed on that observation: a missing observation, or one that fails the
+    connector's TLS policy, denies the request. CPOS never opens the socket, so
+    it judges the producer-supplied observation, never the live handshake.
     """
     if not dry_run:
         registry.audit("execution_request_denied", actor=actor, connector_id=connector_id, decision="real_execution_disabled", metadata={"tool_name": tool_name, "purpose": purpose})
@@ -82,6 +146,14 @@ def request_mcp_execution(
     if decision.get("decision") not in {"allowed", "approval_required"}:
         return {**decision, "ok": False, "error": decision.get("decision"), "execute_automatically": False}
 
+    # Fail-closed TLS gate: a remote connector that declares a tls_policy may not
+    # be executed (even as a dry-run) without a TLS observation that satisfies
+    # that policy. No policy declared, or a stdio connector, means no gate here;
+    # the registry's definition-time check already warns about an absent policy.
+    tls_deny, tls_summary = _check_tls_gate(registry, connector_id, tls_observation, actor=actor)
+    if tls_deny is not None:
+        return tls_deny
+
     args_meta = argument_fingerprint(arguments)
     human_escalation = review_escalation_decision(
         review_type="mcp_tool_execution",
@@ -100,6 +172,7 @@ def request_mcp_execution(
         "execute_automatically": False,
         "tool_executed": False,
         "human_escalation": human_escalation,
+        "tls_verification": tls_summary,
         **args_meta,
     }
     task_id = task_tape.create_task(target=_target(connector_id, tool_name), action="mcp_tool_execution_request", payload=payload)

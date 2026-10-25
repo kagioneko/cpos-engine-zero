@@ -1,8 +1,10 @@
 # MCP TLS Policy & Observation Checking
 
-Status: round 1 — declarative policy + fail-closed verification **primitive**.
-Execution-gate wiring (making `request_mcp_execution` consult a TLS observation
-for remote connectors) is a deliberate follow-up round, not yet implemented.
+Status: round 2 — declarative policy + fail-closed verification **primitive**,
+now wired into the execution gate. `request_mcp_execution` consults a TLS
+observation for a remote connector that declares a `tls_policy`: a missing or
+policy-failing observation denies the request fail-closed (see "Execution gate"
+below). CPOS still never opens a socket.
 
 ## Why
 
@@ -96,7 +98,28 @@ regular file is then read up to 256 KiB + 1 bytes and rejected as too large
 (`O_NONBLOCK` guards the open against a blocking special file; it does not bound
 arbitrary filesystem latency when reading a regular file.)
 
-## Scope / non-goals (this round)
+## Execution gate
+
+`request_mcp_execution(..., tls_observation=...)` enforces the policy at
+tool-execution time, still as a metadata-only dry-run (CPOS never runs the
+tool and never opens the socket):
+
+- The gate applies **only** to a remote (non-`stdio`) connector that declares a
+  `tls_policy`. A `stdio` connector, or a remote connector with no policy, is
+  not gated here — an absent policy is a definition-time warning, not an
+  execution-time block.
+- For a gated connector, a **missing** observation denies with
+  `tls_observation_required`; an observation that **fails** the policy denies
+  with `tls_execution_blocked` and the structured `tls_finding_codes`. Both are
+  fail-closed and are audited (`execution_request_denied` /
+  `tls_observation_verified`); no dry-run task is scheduled.
+- On a passing observation the dry-run proceeds and its Task Tape payload
+  carries a `tls_verification` summary — the decision and finding codes and the
+  boolean result **only**, never observation-supplied values (host, SPKI, …).
+- HTTP: `POST /mcp/executions/dry-run` accepts an optional `tls_observation`
+  object alongside `connector_id` / `tool_name` / `arguments`.
+
+## Scope / non-goals
 
 - CPOS still does not connect. Producing a real observation (doing the TLS
   handshake, computing the SPKI hash, confirming the key log is off) is the job
@@ -105,6 +128,7 @@ arbitrary filesystem latency when reading a regular file.)
   operator-driven block for known-bad CAs, not a revocation service.
 - Full-chain policy is limited to issuer-name matching and leaf SPKI pinning;
   intermediate pinning beyond that is out of scope for now.
-- Next round: consult a passing observation inside `request_mcp_execution` for
-  remote connectors (fail-closed when a policy is declared but no valid
-  observation is attached).
+- The execution gate judges a producer-supplied observation; it does not bind
+  that observation to a specific live handshake (same trust boundary as the
+  verifier). A trusted producer that genuinely performed the TLS checks is still
+  required for the gate to carry real security value.

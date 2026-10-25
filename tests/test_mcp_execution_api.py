@@ -1,7 +1,15 @@
+from datetime import datetime, timedelta, timezone
+
 from agents.main_agent import MainAgent
 from cpos.mcp_registry import MCPRegistry
 from cpos.task_tape import TaskTapeStore
 import server
+
+_PIN = "ab" * 32
+
+
+def _future_iso(days: int = 30) -> str:
+    return (datetime.now(timezone.utc) + timedelta(days=days)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def configure_agent(tmp_path):
@@ -87,6 +95,73 @@ def test_mcp_execution_api_rejects_real_execution_and_secret_args(tmp_path):
     assert real.get_json()["error"] == "real_execution_disabled"
     assert secret.status_code == 400
     assert secret.get_json()["error"] == "secret_like_arguments_blocked"
+
+
+def register_tls_connector(tmp_path):
+    registry = MCPRegistry(tmp_path / "cpos" / "mcp_connectors.json", tmp_path / "cpos" / "mcp_audit.jsonl", tmp_path / "cpos" / "mcp_reviews.jsonl")
+    result = registry.register(
+        {
+            "connector_id": "mcp://secure/search",
+            "name": "Secure MCP",
+            "transport": "https",
+            "url": "https://mcp.example.test/docs",
+            "allowed_tools": ["docs.search"],
+            "requires_human_approval": True,
+            "env_secret_files": {"DOCS_TOKEN_FILE": str(tmp_path / "docs_token_file")},
+            "tls_policy": {
+                "min_version": "TLSv1.2",
+                "pinned_spki_sha256": [_PIN],
+                "require_hostname_match": True,
+                "forbid_key_logging": True,
+            },
+        },
+        confirm=True,
+    )
+    assert result["ok"] is True
+
+
+def test_mcp_execution_api_tls_gate_denies_without_observation(tmp_path):
+    configure_agent(tmp_path)
+    register_tls_connector(tmp_path)
+    client = server.app.test_client()
+
+    denied = client.post(
+        "/mcp/executions/dry-run",
+        json={"connector_id": "mcp://secure/search", "tool_name": "docs.search", "arguments": {"query": "x"}},
+    )
+    assert denied.status_code == 400
+    assert denied.get_json()["error"] == "tls_observation_required"
+    assert client.get("/mcp/executions").get_json()["count"] == 0
+
+
+def test_mcp_execution_api_tls_gate_accepts_passing_observation(tmp_path):
+    configure_agent(tmp_path)
+    register_tls_connector(tmp_path)
+    client = server.app.test_client()
+
+    ok = client.post(
+        "/mcp/executions/dry-run",
+        json={
+            "connector_id": "mcp://secure/search",
+            "tool_name": "docs.search",
+            "arguments": {"query": "x"},
+            "tls_observation": {
+                "negotiated_version": "TLSv1.3",
+                "leaf_spki_sha256": _PIN,
+                "leaf_not_after": _future_iso(),
+                "hostname_matched": True,
+                "keylog_disabled": True,
+                "observed_host": "mcp.example.test",
+            },
+        },
+    )
+    assert ok.status_code == 200
+    body = ok.get_json()
+    assert body["status"] == "pending_review"
+    assert body["event"]["payload"]["tls_verification"]["ok"] is True
+    # Observation values must not be echoed back in the response.
+    assert "mcp.example.test" not in str(body["event"]["payload"])
+    assert _PIN not in str(body["event"]["payload"])
 
 
 def test_mcp_execution_api_scope_mapping():
