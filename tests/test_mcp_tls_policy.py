@@ -438,3 +438,187 @@ def registry_audit_rows(registry):
     from cpos.hash_chain import read_jsonl
 
     return read_jsonl(registry.audit_path)
+
+
+# --------------------------------------------------------------------------- #
+# CPOS②: intermediate SPKI pinning
+# --------------------------------------------------------------------------- #
+
+INTER_PIN = "cd" * 32  # 64 hex chars, distinct from leaf PIN
+OTHER_HASH = "ef" * 32
+
+
+def _policy_with_intermediate(*pins):
+    p = good_policy()
+    p["pinned_intermediate_spki_sha256"] = list(pins)
+    return p
+
+
+def _obs_with_chain(*spki):
+    obs = good_observation()
+    obs["chain_spki_sha256"] = list(spki)
+    return obs
+
+
+def test_check_policy_accepts_intermediate_pins():
+    assert check_tls_policy_definition(_policy_with_intermediate(INTER_PIN)) == []
+
+
+def test_check_policy_rejects_non_list_intermediate_pins():
+    bad = {**good_policy(), "pinned_intermediate_spki_sha256": "nope"}
+    codes = {f["code"] for f in check_tls_policy_definition(bad)}
+    assert "tls_intermediate_pins_invalid" in codes
+
+
+def test_check_policy_rejects_malformed_intermediate_pin():
+    codes = {f["code"] for f in check_tls_policy_definition(_policy_with_intermediate("xyz"))}
+    assert "tls_intermediate_pin_malformed" in codes
+
+
+def test_check_policy_warns_empty_intermediate_pins():
+    findings = check_tls_policy_definition(_policy_with_intermediate())
+    codes = {f["code"] for f in findings}
+    assert "tls_intermediate_pins_empty" in codes
+    # empty is a warning, not an error -> registration not blocked
+    assert all(f["severity"] != "error" for f in findings)
+
+
+def test_parse_normalizes_intermediate_pins():
+    effective = parse_tls_policy(_policy_with_intermediate(INTER_PIN.upper(), "  " + OTHER_HASH + "  "))
+    assert effective["pinned_intermediate_spki_sha256"] == [INTER_PIN, OTHER_HASH]
+
+
+def test_verify_intermediate_pin_passes_when_present():
+    policy = _policy_with_intermediate(INTER_PIN)
+    # case-insensitive match, mixed with other chain entries
+    obs = _obs_with_chain(OTHER_HASH, INTER_PIN.upper())
+    result = verify_tls_observation(connector(policy), obs)
+    assert result["ok"] is True
+    assert result["decision"] == "tls_allowed"
+
+
+def test_verify_intermediate_pin_denies_on_mismatch():
+    policy = _policy_with_intermediate(INTER_PIN)
+    obs = _obs_with_chain(OTHER_HASH, "12" * 32)
+    result = verify_tls_observation(connector(policy), obs)
+    assert result["ok"] is False
+    codes = {f["code"] for f in result["findings"]}
+    assert "tls_intermediate_spki_mismatch" in codes
+
+
+def test_verify_intermediate_pin_denies_when_chain_absent():
+    # fail-closed: policy pins an intermediate but observation omits the chain
+    policy = _policy_with_intermediate(INTER_PIN)
+    obs = good_observation()  # no chain_spki_sha256
+    result = verify_tls_observation(connector(policy), obs)
+    assert result["ok"] is False
+    codes = {f["code"] for f in result["findings"]}
+    assert "tls_intermediate_chain_malformed" in codes
+
+
+def test_verify_intermediate_pin_denies_on_empty_chain():
+    policy = _policy_with_intermediate(INTER_PIN)
+    obs = _obs_with_chain()  # present but empty
+    result = verify_tls_observation(connector(policy), obs)
+    assert result["ok"] is False
+    codes = {f["code"] for f in result["findings"]}
+    assert "tls_intermediate_spki_missing" in codes
+
+
+def test_verify_intermediate_pin_denies_on_malformed_chain_entry():
+    # a non-hex entry makes the whole chain untrusted -> deny, never skip
+    policy = _policy_with_intermediate(INTER_PIN)
+    obs = _obs_with_chain(INTER_PIN, "not-a-hash")
+    result = verify_tls_observation(connector(policy), obs)
+    assert result["ok"] is False
+    codes = {f["code"] for f in result["findings"]}
+    assert "tls_intermediate_chain_malformed" in codes
+
+
+def test_verify_intermediate_pin_denies_on_oversized_chain():
+    policy = _policy_with_intermediate(INTER_PIN)
+    obs = _obs_with_chain(*([INTER_PIN] * 65))  # over _MAX_CHAIN_ENTRIES
+    result = verify_tls_observation(connector(policy), obs)
+    assert result["ok"] is False
+    codes = {f["code"] for f in result["findings"]}
+    assert "tls_intermediate_chain_malformed" in codes
+
+
+def test_verify_without_intermediate_pin_ignores_chain_spki():
+    # backward-compat: a policy that does not pin intermediates must not require
+    # chain_spki_sha256; the field's absence is fine.
+    result = verify_tls_observation(connector(good_policy()), good_observation())
+    assert result["ok"] is True
+
+
+def test_verify_findings_never_echo_chain_spki_values():
+    policy = _policy_with_intermediate(INTER_PIN)
+    obs = _obs_with_chain(OTHER_HASH)
+    result = verify_tls_observation(connector(policy), obs)
+    assert result["ok"] is False
+    # the mismatching observed hash must not be echoed into finding messages
+    assert OTHER_HASH not in json.dumps(result["findings"])
+
+
+# --- intermediate pinning: non-blocking regression coverage (Codex round 4) ---
+
+
+@pytest.mark.parametrize("bad_chain", [
+    "not-a-list",
+    {"spki": INTER_PIN},
+    None,
+    [INTER_PIN, None],
+    [INTER_PIN, True],
+    [INTER_PIN, 123],
+    [INTER_PIN, {"nested": "x"}],
+])
+def test_verify_intermediate_denies_on_non_string_or_non_list_chain(bad_chain):
+    policy = _policy_with_intermediate(INTER_PIN)
+    obs = good_observation()
+    obs["chain_spki_sha256"] = bad_chain
+    result = verify_tls_observation(connector(policy), obs)
+    assert result["ok"] is False
+    assert "tls_intermediate_chain_malformed" in {f["code"] for f in result["findings"]}
+
+
+def test_verify_intermediate_passes_at_chain_size_bound():
+    # exactly _MAX_CHAIN_ENTRIES (64) well-formed entries incl. the pin -> ok
+    policy = _policy_with_intermediate(INTER_PIN)
+    filler = [f"{i:064x}" for i in range(63)]
+    obs = _obs_with_chain(*(filler + [INTER_PIN]))
+    result = verify_tls_observation(connector(policy), obs)
+    assert result["ok"] is True
+
+
+def test_verify_intermediate_matches_despite_surrounding_whitespace():
+    policy = _policy_with_intermediate(INTER_PIN)
+    obs = _obs_with_chain("  " + INTER_PIN.upper() + "  ")
+    result = verify_tls_observation(connector(policy), obs)
+    assert result["ok"] is True
+
+
+def test_verify_intermediate_or_matches_any_pinned():
+    # multiple pins: presence of any one in the chain passes
+    policy = _policy_with_intermediate(INTER_PIN, OTHER_HASH)
+    obs = _obs_with_chain("12" * 32, OTHER_HASH)
+    result = verify_tls_observation(connector(policy), obs)
+    assert result["ok"] is True
+
+
+def test_verify_runtime_denies_on_invalid_intermediate_policy():
+    # a malformed intermediate pin is an error at definition time; the verifier
+    # must also deny fail-closed rather than silently drop the bad pin.
+    bad_policy = {**good_policy(), "pinned_intermediate_spki_sha256": ["xyz"]}
+    result = verify_tls_observation(connector(bad_policy), _obs_with_chain(INTER_PIN))
+    assert result["ok"] is False
+    assert "tls_intermediate_pin_malformed" in {f["code"] for f in result["findings"]}
+
+
+def test_verify_empty_intermediate_pins_ignore_bad_chain():
+    # backward-compat: an empty pin list enforces nothing, so even a malformed
+    # chain_spki_sha256 does not block (no intermediate pin is in effect).
+    policy = _policy_with_intermediate()  # empty list
+    obs = good_observation()
+    obs["chain_spki_sha256"] = "garbage"
+    result = verify_tls_observation(connector(policy), obs)
+    assert result["ok"] is True

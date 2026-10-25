@@ -47,6 +47,7 @@ DEFAULT_FORBID_KEY_LOGGING = True
 _KNOWN_POLICY_KEYS = {
     "min_version",
     "pinned_spki_sha256",
+    "pinned_intermediate_spki_sha256",
     "forbidden_issuers",
     "require_hostname_match",
     "forbid_key_logging",
@@ -109,6 +110,34 @@ def _collect_issuer_names(chain: Any) -> tuple[list[str], bool]:
     return (names, well_formed)
 
 
+def _collect_chain_spki(chain: Any) -> tuple[set[str], bool]:
+    """Collect lowercased hex SPKI sha256 hashes from a ``chain_spki_sha256``
+    observation (the SPKI hashes of the certs the producer saw in the presented
+    chain).
+
+    Returns ``(hashes, well_formed)``. ``well_formed`` is False if the value is
+    not a list, is over the size bound, or contains an entry that is not a
+    64-char hex sha256. A caller that pins intermediates MUST deny when
+    ``well_formed`` is False, so a malformed entry cannot hide a missing pin.
+    """
+    if not isinstance(chain, list):
+        return (set(), False)
+    if len(chain) > _MAX_CHAIN_ENTRIES:
+        return (set(), False)
+    hashes: set[str] = set()
+    well_formed = True
+    for entry in chain:
+        if not isinstance(entry, str):
+            well_formed = False
+            continue
+        token = entry.strip().lower()
+        if not _HEX64.match(token):
+            well_formed = False
+            continue
+        hashes.add(token)
+    return (hashes, well_formed)
+
+
 def parse_tls_policy(policy: Any) -> dict[str, Any]:
     """Return the effective policy with defaults applied. Shape is NOT validated
     here (see ``check_tls_policy_definition``). ``verify_tls_observation`` runs
@@ -116,10 +145,12 @@ def parse_tls_policy(policy: Any) -> dict[str, Any]:
     policy is known well-formed."""
     policy = policy if isinstance(policy, dict) else {}
     pins = policy.get("pinned_spki_sha256") or []
+    inter = policy.get("pinned_intermediate_spki_sha256") or []
     forbidden = policy.get("forbidden_issuers") or []
     return {
         "min_version": _normalize_version(policy.get("min_version")) or DEFAULT_MIN_VERSION,
         "pinned_spki_sha256": [str(p).strip().lower() for p in pins] if isinstance(pins, list) else [],
+        "pinned_intermediate_spki_sha256": [str(p).strip().lower() for p in inter] if isinstance(inter, list) else [],
         "forbidden_issuers": [str(i).strip().casefold() for i in forbidden if str(i).strip()] if isinstance(forbidden, list) else [],
         "require_hostname_match": bool(policy.get("require_hostname_match", DEFAULT_REQUIRE_HOSTNAME_MATCH)),
         "forbid_key_logging": bool(policy.get("forbid_key_logging", DEFAULT_FORBID_KEY_LOGGING)),
@@ -161,6 +192,17 @@ def check_tls_policy_definition(policy: Any) -> list[dict[str, str]]:
                 if not isinstance(pin, str) or not _HEX64.match(pin.strip().lower()):
                     findings.append(_finding("error", "tls_pin_malformed", "each SPKI pin must be a 64-char hex sha256 of the DER SubjectPublicKeyInfo", "tls_policy.pinned_spki_sha256"))
 
+    if "pinned_intermediate_spki_sha256" in policy:
+        inter = policy.get("pinned_intermediate_spki_sha256")
+        if not isinstance(inter, list):
+            findings.append(_finding("error", "tls_intermediate_pins_invalid", "pinned_intermediate_spki_sha256 must be a list of lowercase hex sha256 strings", "tls_policy.pinned_intermediate_spki_sha256"))
+        elif not inter:
+            findings.append(_finding("warning", "tls_intermediate_pins_empty", "pinned_intermediate_spki_sha256 is empty; no intermediate SPKI pin is enforced", "tls_policy.pinned_intermediate_spki_sha256"))
+        else:
+            for pin in inter:
+                if not isinstance(pin, str) or not _HEX64.match(pin.strip().lower()):
+                    findings.append(_finding("error", "tls_intermediate_pin_malformed", "each intermediate SPKI pin must be a 64-char hex sha256 of the DER SubjectPublicKeyInfo", "tls_policy.pinned_intermediate_spki_sha256"))
+
     if "forbidden_issuers" in policy:
         forbidden = policy.get("forbidden_issuers")
         if not isinstance(forbidden, list) or any(not isinstance(i, str) or not i.strip() for i in forbidden):
@@ -183,6 +225,8 @@ def verify_tls_observation(connector: Any, observation: Any, *, connector_url: s
     Observation fields (absence of one the policy needs is an error):
       - ``negotiated_version``: e.g. "TLSv1.3"
       - ``leaf_spki_sha256``: hex sha256 of the DER SubjectPublicKeyInfo
+      - ``chain_spki_sha256``: list of hex sha256 SPKI of the certs in the
+        presented chain (used for intermediate pinning)
       - ``chain_issuers``: list of {"O":..., "CN":...} issuer names
       - ``leaf_not_after``: ISO-8601 leaf expiry (``Z`` or offset)
       - ``hostname_matched``: bool, cert matched the host
@@ -233,6 +277,22 @@ def verify_tls_observation(connector: Any, observation: Any, *, connector_url: s
             findings.append(_finding("error", "tls_chain_issuers_missing", "policy forbids issuers but observation carries no chain_issuers to check", "observation.chain_issuers"))
         elif set(observed_issuers) & set(policy["forbidden_issuers"]):
             findings.append(_finding("error", "tls_issuer_forbidden", "certificate chain includes a forbidden issuer", "observation.chain_issuers"))
+
+    # --- intermediate SPKI pinning (pin a known-good issuing CA key) ---
+    # Leaf pinning alone breaks on legitimate leaf-key rotation; pinning the
+    # issuing CA's SPKI survives that while still rejecting a chain built by a
+    # different (rogue) intermediate. At least one pinned intermediate SPKI must
+    # appear among the chain SPKIs the producer reports.
+    if policy["pinned_intermediate_spki_sha256"]:
+        chain_spki, well_formed = _collect_chain_spki(observation.get("chain_spki_sha256"))
+        if not well_formed:
+            # A malformed/oversized/absent chain cannot be trusted to not hide a
+            # missing pin -> deny rather than skip.
+            findings.append(_finding("error", "tls_intermediate_chain_malformed", "chain_spki_sha256 is missing, malformed, or too large to evaluate", "observation.chain_spki_sha256"))
+        elif not chain_spki:
+            findings.append(_finding("error", "tls_intermediate_spki_missing", "policy pins an intermediate SPKI but observation carries no chain_spki_sha256 to check", "observation.chain_spki_sha256"))
+        elif not (set(policy["pinned_intermediate_spki_sha256"]) & chain_spki):
+            findings.append(_finding("error", "tls_intermediate_spki_mismatch", "no pinned intermediate SPKI is present in the presented chain (possible rogue issuing CA)", "observation.chain_spki_sha256"))
 
     # --- hostname match: require both the asserted flag AND a matching host ---
     if policy["require_hostname_match"]:
